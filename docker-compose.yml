@@ -14,11 +14,19 @@ services:
     build: .
     depends_on:
       - icecast
+    ports:
+      - "8080:8080"
     volumes:
       - ./tracklist:/app/tracklist:ro
     environment:
       ICECAST_URL: http://icecast:8000
       ICECAST_SOURCE_PASSWORD: hackme
       ICECAST_MOUNT: /radio.mp3
-      STREAM_BITRATE_KBPS: 128
+      STATION_ID: ${STATION_ID:-default}
+      STATION_COUNT: ${STATION_COUNT:-}
+      STATIONS: ${STATIONS:-}
+      STATION_NAME: ${STATION_NAME:-}
+      HTTP_ADDR: :8080
+      PLAYLIST_DIR: tracklist
+      ANNOUNCEMENTS_DIR: ""
     restart: unless-stopped
