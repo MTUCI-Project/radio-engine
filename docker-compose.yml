@@ -1,0 +1,24 @@
+services:
+  icecast:
+    image: moul/icecast
+    ports:
+      - "8000:8000"
+    environment:
+      ICECAST_SOURCE_PASSWORD: hackme
+      ICECAST_ADMIN_PASSWORD: admin
+      ICECAST_RELAY_PASSWORD: hackme
+      ICECAST_HOSTNAME: localhost
+    restart: unless-stopped
+
+  radio:
+    build: .
+    depends_on:
+      - icecast
+    volumes:
+      - ./tracklist:/app/tracklist:ro
+    environment:
+      ICECAST_URL: http://icecast:8000
+      ICECAST_SOURCE_PASSWORD: hackme
+      ICECAST_MOUNT: /radio.mp3
+      STREAM_BITRATE_KBPS: 128
+    restart: unless-stopped
