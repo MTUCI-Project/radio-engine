@@ -19,7 +19,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	manager, err := radio.NewManager(cfg.Stations)
+	manager, err := 
+	radio.NewManager(cfg.Stations)
 	if err != nil {
 		log.Fatalf("create radio manager: %v", err)
 	}
