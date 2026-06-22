@@ -82,6 +82,38 @@ func (s *Session) Stream(ctx context.Context, dst io.Writer, src io.Reader, comm
 	}
 }
 
+func (s *Session) StreamSilence(ctx context.Context, dst io.Writer, commands <-chan struct{}) error {
+	frame, duration, ok := parseSilentFrame()
+	if !ok {
+		return errors.New("embedded silent mp3 frame is invalid")
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		select {
+		case <-commands:
+			return ErrSkipped
+		default:
+		}
+
+		if _, err := dst.Write(frame); err != nil {
+			return fmt.Errorf("write silent mp3 frame: %w", err)
+		}
+		if duration <= 0 {
+			duration = s.streamer.frameFallbackDelay()
+		}
+		if err := s.pacer.wait(ctx, commands, duration); err != nil {
+			return err
+		}
+	}
+}
+
+func (s *Session) ResetTiming() {
+	s.pacer.reset(time.Now(), s.streamer.initialBuffer())
+}
+
 func (s *Streamer) frameFallbackDelay() time.Duration {
 	if s.FrameFallbackDelay <= 0 {
 		return 26 * time.Millisecond
@@ -293,8 +325,9 @@ func newPacer(start time.Time, lead time.Duration) *pacer {
 }
 
 func (p *pacer) wait(ctx context.Context, commands <-chan struct{}, frameDuration time.Duration) error {
-	delay := p.nextDelay(time.Now(), frameDuration)
+	delay := p.delayFor(time.Now(), frameDuration)
 	if delay <= 0 {
+		p.advance(frameDuration)
 		return nil
 	}
 
@@ -307,11 +340,53 @@ func (p *pacer) wait(ctx context.Context, commands <-chan struct{}, frameDuratio
 	case <-commands:
 		return ErrSkipped
 	case <-timer.C:
+		p.advance(frameDuration)
 		return nil
 	}
 }
 
-func (p *pacer) nextDelay(now time.Time, frameDuration time.Duration) time.Duration {
-	p.elapsed += frameDuration
-	return p.start.Add(p.elapsed - p.lead).Sub(now)
+func (p *pacer) delayFor(now time.Time, frameDuration time.Duration) time.Duration {
+	return p.start.Add(p.elapsed + frameDuration - p.lead).Sub(now)
 }
+
+func (p *pacer) advance(frameDuration time.Duration) {
+	p.elapsed += frameDuration
+}
+
+func (p *pacer) reset(start time.Time, lead time.Duration) {
+	if lead < 0 {
+		lead = 0
+	}
+	p.start = start
+	p.elapsed = 0
+	p.lead = lead
+}
+
+func makeSilentMP3Frame() []byte {
+	frame := []byte{
+		0xff, 0xfb, 0x92, 0xc4, 0x39, 0x03, 0xc0, 0x00,
+		0x01, 0xa4, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00,
+		0x34, 0x80, 0x00, 0x00, 0x04,
+	}
+	for len(frame) < 257 {
+		frame = append(frame, 0x55)
+	}
+	frame = append(frame, []byte("LAME3.101 (beta 3)")...)
+	for len(frame) < 418 {
+		frame = append(frame, 0x55)
+	}
+	return frame
+}
+
+func parseSilentFrame() ([]byte, time.Duration, bool) {
+	frame := makeSilentMP3Frame()
+	var header [4]byte
+	copy(header[:], frame[:4])
+	info, ok := parseHeader(header)
+	if !ok || info.frameSize != len(frame) {
+		return nil, 0, false
+	}
+	return frame, info.duration, true
+}
+
+const silentMP3FrameBase64 = "//uSxDkDwAABpAAAACAAADSAAAAEVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMSAoYmV0YSAzKVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVQ=="

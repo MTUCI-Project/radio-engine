@@ -1,8 +1,8 @@
 # Radio Engine
 
-Небольшой сервис онлайн-радио на Go. Он читает MP3-плейлисты, держит source-подключения к Icecast2 и может обслуживать несколько станций в одном процессе.
+Stateless Go media-worker для онлайн-радио. Бизнес-бек владеет станциями и полной очередью, а этот сервис держит короткое runtime-окно, читает media из MinIO/S3, микширует PCM-аудио через FFmpeg, отдаёт MP3 source-потоки в Icecast и публикует события в Redis Streams.
 
-## Запуск
+## Быстрый запуск
 
 ```bash
 docker compose up --build
@@ -10,157 +10,139 @@ docker compose up --build
 
 После запуска:
 
-- stream одной станции: <http://localhost:8000/radio.mp3>
-- Icecast2 status page: <http://localhost:8000/>
-- command API: <http://localhost:8080/stations>
+- API: <http://localhost:8080/v1/stations>
+- health: <http://localhost:8080/health/ready>
+- metrics: <http://localhost:8080/metrics>
+- Icecast: <http://localhost:8000/>
+- MinIO console: <http://localhost:9001/>
 
-По умолчанию сервис берет все `.mp3` из `tracklist/` и играет их по кругу.
+Сервис стартует без станций. Backend должен создать станции заново после рестарта worker-а.
 
-Для локального запуска без Docker:
+## API v1
 
-```bash
-go run ./cmd/radio
-```
-
-Чтобы запустить конкретный файл вместо директории:
+Создать или обновить станцию со стабильным backend ID:
 
 ```bash
-TRACK_PATH="tracklist/The Ink Spots - Maybe.mp3" go run ./cmd/radio
-```
-
-## Несколько станций
-
-Станции живут внутри одного Go-процесса: на каждую станцию создается горутина, плейлист и одно source-соединение к Icecast. Отдельные процессы под станции не запускаются.
-
-Быстрый запуск 10 одинаково настроенных станций:
-
-```bash
-STATION_COUNT=10 go run ./cmd/radio
-```
-
-Через Docker Compose:
-
-```bash
-STATION_COUNT=10 docker compose up --build
-```
-
-Потоки будут доступны как:
-
-- `http://localhost:8000/station-1.mp3`
-- `http://localhost:8000/station-2.mp3`
-- ...
-- `http://localhost:8000/station-10.mp3`
-
-Явный список станций:
-
-```bash
-STATIONS=main,news go run ./cmd/radio
-```
-
-Для переопределений используется префикс `STATION_<ID>_`, где все не буквы и не цифры заменяются на `_`, а буквы приводятся к верхнему регистру:
-
-```bash
-STATIONS=main,news \
-STATION_MAIN_NAME="Main Radio" \
-STATION_MAIN_MOUNT=/main.mp3 \
-STATION_MAIN_PLAYLIST_DIR=tracklist/main \
-STATION_NEWS_NAME="News Radio" \
-STATION_NEWS_MOUNT=/news.mp3 \
-STATION_NEWS_PLAYLIST_DIR=tracklist/news \
-go run ./cmd/radio
-```
-
-## Команды
-
-Команды вызываются через HTTP API. По умолчанию API слушает `:8080`; адрес меняется через `HTTP_ADDR`.
-
-Посмотреть все станции:
-
-```bash
-curl http://localhost:8080/stations
-```
-
-Посмотреть состояние одной станции:
-
-```bash
-curl http://localhost:8080/stations/default
-```
-
-Пропустить текущий трек:
-
-```bash
-curl -X POST http://localhost:8080/stations/default/skip
-```
-
-Проиграть следующий announcement из `ANNOUNCEMENTS_DIR`:
-
-```bash
-curl -X POST http://localhost:8080/stations/default/announcement
-```
-
-Проиграть конкретный announcement-файл:
-
-```bash
-curl -X POST http://localhost:8080/stations/default/announcement \
+curl -X PUT http://localhost:8080/v1/stations/main \
   -H 'Content-Type: application/json' \
-  -d '{"path":"tracklist/announcement.mp3"}'
+  -d '{
+    "name": "Main Radio",
+    "description": "Main stream",
+    "genre": "Various",
+    "output": { "bitrateKbps": 192 },
+    "transitionDefaults": { "type": "crossfade", "durationMs": 2500 },
+    "announcementProfile": {
+      "musicGainDb": -12,
+      "announcementGainDb": 0,
+      "attackMs": 180,
+      "releaseMs": 450,
+      "mid": { "enabled": true, "gainDb": -18 },
+      "high": { "enabled": true, "gainDb": -14 },
+      "limiterThresholdDb": -1
+    }
+  }'
 ```
 
-Универсальная отправка команды:
+Заменить пять следующих треков:
 
 ```bash
-curl -X POST http://localhost:8080/stations/default/commands \
+curl -X PUT http://localhost:8080/v1/stations/main/queue \
   -H 'Content-Type: application/json' \
-  -d '{"type":"skip_track"}'
+  -d '{
+    "revision": 1,
+    "tracks": [
+      {
+        "itemId": "track-001",
+        "media": { "bucket": "music", "objectKey": "tracks/track-001.flac" },
+        "title": "Track 001",
+        "transitionIn": { "type": "crossfade", "durationMs": 3000 }
+      }
+    ]
+  }'
 ```
 
-Поддерживаемые `type`:
+Правила очереди:
 
-- `skip_track` - пропустить текущий трек;
-- `play_announcement` - прервать текущий трек и проиграть announcement.
+- engine хранит текущий трек отдельно и максимум 5 следующих;
+- `revision` должен монотонно расти, иначе API вернёт `409 stale_revision`;
+- замена очереди не прерывает текущий трек;
+- `transitionIn` описывает переход от предыдущего трека к этому;
+- если media недоступно или не декодируется, engine публикует failure event и переходит дальше.
 
-Если очередь команд станции переполнена, API вернет `503`.
+Поставить оповещение в FIFO:
+
+```bash
+curl -X POST http://localhost:8080/v1/stations/main/announcements \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commandId": "alert-42",
+    "media": { "bucket": "alerts", "objectKey": "weather.wav" },
+    "title": "Weather alert"
+  }'
+```
+
+Повторный `commandId` идемпотентен. Оповещения накладываются поверх музыки с профилем станции; текущее оповещение не прерывается новым.
+
+Команды:
+
+```bash
+curl -X POST http://localhost:8080/v1/stations/main/stop
+curl -X POST http://localhost:8080/v1/stations/main/play
+curl -X POST http://localhost:8080/v1/stations/main/skip
+curl http://localhost:8080/v1/stations/main
+curl -X DELETE http://localhost:8080/v1/stations/main
+```
+
+`stop` останавливает музыкальную очередь, но не блокирует внеплановые оповещения.
+
+## Архитектура аудио
+
+Для каждой активной станции создаётся один realtime-loop:
+
+1. MinIO/S3 object скачивается в ограниченный disk cache.
+2. FFmpeg декодирует media в PCM `48 kHz stereo f32le`.
+3. Go mixer применяет переходы, ducking/EQ bands для оповещений и limiter.
+4. Постоянный FFmpeg encoder кодирует PCM в MP3.
+5. MP3 поток пишется в Icecast source connection.
+
+Idle-станция продолжает отдавать тишину, чтобы mount не исчезал у клиентов.
+
+## Redis события
+
+События пишутся в Redis Stream `radio.events` с envelope:
+
+- `eventId`
+- `type`
+- `stationId`
+- `instanceId`
+- `sequence`
+- `timestamp`
+- `correlationId`
+- `payload`
+
+Доставка в Redis — at-least-once; backend дедуплицирует по `eventId`.
 
 ## Переменные окружения
 
-- `ICECAST_URL` default `http://127.0.0.1:8000`
-- `ICECAST_SOURCE_USER` default `source`
-- `ICECAST_SOURCE_PASSWORD` default `hackme`
-- `ICECAST_MOUNT` default `/radio.mp3` для одной станции
-- `STATION_ID` default `default`
-- `STATION_NAME` default `Radio Engine <id>`
-- `PLAYLIST_DIR` default `tracklist`
-- `TRACK_PATH` optional single MP3 file instead of playlist directory
-- `ANNOUNCEMENTS_DIR` optional directory with announcement MP3 files
-- `RECONNECT_DELAY_SECONDS` default `3`
-- `HTTP_ADDR` default `:8080`
-- `STATIONS` optional comma-separated station ids, for example `main,news`
-- `STATION_COUNT` optional generated station count, for example `10`
-- `STATION_<ID>_NAME`
-- `STATION_<ID>_MOUNT`
-- `STATION_<ID>_PLAYLIST_DIR`
-- `STATION_<ID>_TRACK_PATH`
-- `STATION_<ID>_ANNOUNCEMENTS_DIR`
-- `STATION_<ID>_DESCRIPTION`
-- `STATION_<ID>_GENRE`
-- `STATION_<ID>_RECONNECT_DELAY_SECONDS`
+- `HTTP_ADDR`, default `:8080`
+- `HTTP_BEARER_TOKEN`, optional
+- `INSTANCE_ID`, default hostname
+- `MAX_STATIONS`, default `20`
+- `ICECAST_URL`, default `http://127.0.0.1:8000`
+- `ICECAST_SOURCE_USER`, default `source`
+- `ICECAST_SOURCE_PASSWORD`, default `hackme`
+- `MINIO_ENDPOINT`, default `127.0.0.1:9000`
+- `MINIO_ACCESS_KEY`, default `minioadmin`
+- `MINIO_SECRET_KEY`, default `minioadmin`
+- `MINIO_SECURE`, default `false`
+- `MINIO_RETRIES`, default `3`
+- `MEDIA_CACHE_DIR`, default `/tmp/radio-engine-cache`
+- `MEDIA_CACHE_MAX_BYTES`, default `5368709120`
+- `REDIS_ADDR`, default `127.0.0.1:6379`
+- `REDIS_PASSWORD`, optional
+- `REDIS_DB`, default `0`
+- `REDIS_STREAM`, default `radio.events`
+- `FFMPEG_PATH`, default `ffmpeg`
+- `FFPROBE_PATH`, default `ffprobe`
 
-## Поток
-
-MP3 отправляется по frame pacing: сервис читает MP3-фреймы, вычисляет длительность каждого фрейма из заголовка и пишет в Icecast с правильной скоростью для CBR и VBR.
-
-Чтобы браузер не заикался после нескольких минут и на границах треков, стример держит небольшой стартовый запас аудио и по умолчанию не отправляет ID3v2-теги из файлов в live-поток.
-
-## Архитектура
-
-Главная точка входа: [cmd/radio/main.go](cmd/radio/main.go).
-
-Пакеты:
-
-- `internal/api` - HTTP API для состояния и команд;
-- `internal/config` - конфигурация из переменных окружения;
-- `internal/icecast` - source-клиент Icecast;
-- `internal/mp3stream` - MP3 frame pacing и разбор заголовков;
-- `internal/playlist` - загрузка MP3 из директории;
-- `internal/radio` - менеджер нескольких станций;
-- `internal/station` - playback loop, состояние и команды станции.
+Горизонтальный масштаб делается несколькими worker-репликами. Backend выбирает worker, создаёт станции через `PUT /v1/stations/{stationId}` и повторно применяет конфигурацию/очередь после рестарта.

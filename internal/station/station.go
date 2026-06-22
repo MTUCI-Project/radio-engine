@@ -3,15 +3,30 @@ package station
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"log"
-	"os"
 	"sync"
 	"time"
 
-	"radio_engine/internal/mp3stream"
+	"radio_engine/internal/audio"
+	"radio_engine/internal/events"
+	"radio_engine/internal/media"
+	"radio_engine/internal/observability"
 	"radio_engine/internal/playlist"
+)
+
+const MaxQueueTracks = playlist.MaxQueueTracks
+
+const (
+	ModeIdle    = "idle"
+	ModePlaying = "playing"
+	ModeStopped = "stopped"
+)
+
+var (
+	ErrQueueTooLarge     = errors.New("station queue is too large")
+	ErrStaleRevision     = errors.New("queue revision is stale")
+	ErrCommandQueueFull  = errors.New("station command queue is full")
+	ErrAnnouncementQueue = errors.New("announcement queue is full")
 )
 
 type Source interface {
@@ -20,260 +35,233 @@ type Source interface {
 }
 
 type Config struct {
-	ID               string
-	Name             string
-	PlaylistDir      string
-	AnnouncementsDir string
-	InitialTrackPath string
-	ReconnectDelay   time.Duration
+	ID                  string                    `json:"id"`
+	Name                string                    `json:"name"`
+	Description         string                    `json:"description,omitempty"`
+	Genre               string                    `json:"genre,omitempty"`
+	Public              bool                      `json:"public"`
+	Mount               string                    `json:"mount"`
+	StreamURL           string                    `json:"streamUrl"`
+	Output              audio.OutputConfig        `json:"output"`
+	TransitionDefaults  playlist.Transition       `json:"transitionDefaults"`
+	AnnouncementProfile audio.AnnouncementProfile `json:"announcementProfile"`
+}
+
+func (c Config) Normalize() Config {
+	c.Output = c.Output.Normalize()
+	c.TransitionDefaults = c.TransitionDefaults.Normalize(playlist.DefaultTransition())
+	c.AnnouncementProfile = c.AnnouncementProfile.Normalize()
+	return c
+}
+
+type QueueState struct {
+	Revision uint64           `json:"revision"`
+	Tracks   []playlist.Track `json:"tracks"`
 }
 
 type State struct {
-	ID           string
-	Name         string
-	CurrentTrack playlist.Track
-	Playing      bool
-	StartedAt    time.Time
+	Config               Config                 `json:"config"`
+	Mode                 string                 `json:"mode"`
+	CurrentTrack         *playlist.Track        `json:"currentTrack"`
+	Queue                QueueState             `json:"queue"`
+	CurrentAnnouncement  *playlist.Announcement `json:"currentAnnouncement"`
+	PendingAnnouncements int                    `json:"pendingAnnouncements"`
+	StartedAt            time.Time              `json:"startedAt,omitempty"`
+	LastError            string                 `json:"lastError,omitempty"`
+	Connected            bool                   `json:"connected"`
+}
+
+type Dependencies struct {
+	Source    Source
+	Media     media.Store
+	FFmpeg    *audio.FFmpeg
+	Events    events.Publisher
+	Metrics   *observability.Metrics
+	Reconnect time.Duration
 }
 
 type Station struct {
-	ID       string
-	Name     string
-	Commands chan Command
+	ID   string
+	Name string
 
-	source        Source
-	playlist      *playlist.Playlist
-	announcements *playlist.Playlist
-	streamer      *mp3stream.Streamer
+	deps Dependencies
 
-	mu    sync.RWMutex
-	state State
+	mu            sync.Mutex
+	config        Config
+	mode          string
+	current       *playlist.Track
+	queue         []playlist.Track
+	revision      uint64
+	startedAt     time.Time
+	lastError     string
+	connected     bool
+	announcements []playlist.Announcement
+	currentAnn    *playlist.Announcement
+	seenCommands  map[string]struct{}
+	sequence      uint64
+
+	commands chan Command
+	wakeup   chan struct{}
 }
 
-func New(cfg Config, source Source) (*Station, error) {
+func New(cfg Config, deps Dependencies) (*Station, error) {
 	if cfg.ID == "" {
-		cfg.ID = "default"
+		return nil, errors.New("station id is required")
 	}
 	if cfg.Name == "" {
 		cfg.Name = cfg.ID
 	}
-
-	var list *playlist.Playlist
-	var err error
-	if cfg.InitialTrackPath != "" {
-		list = playlist.Single(cfg.InitialTrackPath)
-	} else {
-		list, err = playlist.FromDir(cfg.PlaylistDir)
-		if err != nil {
-			return nil, fmt.Errorf("load playlist: %w", err)
-		}
+	if deps.Source == nil {
+		return nil, errors.New("station source is required")
 	}
-
-	if cfg.ReconnectDelay <= 0 {
-		cfg.ReconnectDelay = 3 * time.Second
+	if deps.Media == nil {
+		return nil, errors.New("media store is required")
 	}
-
-	var announcements *playlist.Playlist
-	if cfg.AnnouncementsDir != "" {
-		announcements, err = playlist.FromDir(cfg.AnnouncementsDir)
-		if err != nil {
-			return nil, fmt.Errorf("load announcements: %w", err)
-		}
+	if deps.FFmpeg == nil {
+		return nil, errors.New("ffmpeg service is required")
 	}
-
-	station := &Station{
-		ID:            cfg.ID,
-		Name:          cfg.Name,
-		Commands:      make(chan Command, 16),
-		source:        source,
-		playlist:      list,
-		announcements: announcements,
-		streamer:      mp3stream.NewStreamer(),
+	if deps.Events == nil {
+		deps.Events = &events.MemoryPublisher{}
 	}
-	station.state = State{ID: cfg.ID, Name: cfg.Name}
-	return station, nil
+	if deps.Reconnect <= 0 {
+		deps.Reconnect = 3 * time.Second
+	}
+	cfg.StreamURL = deps.Source.MountURL()
+	cfg = cfg.Normalize()
+	return &Station{
+		ID:           cfg.ID,
+		Name:         cfg.Name,
+		deps:         deps,
+		config:       cfg,
+		mode:         ModeIdle,
+		seenCommands: make(map[string]struct{}),
+		commands:     make(chan Command, 32),
+		wakeup:       make(chan struct{}, 1),
+	}, nil
 }
 
 func (s *Station) State() State {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.state
-}
-
-func (s *Station) Run(ctx context.Context, reconnectDelay time.Duration) error {
-	if reconnectDelay <= 0 {
-		reconnectDelay = 3 * time.Second
-	}
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		conn, err := s.source.Connect(ctx)
-		if err != nil {
-			log.Printf("station %s: source connection failed: %v", s.ID, err)
-			if err := sleep(ctx, reconnectDelay); err != nil {
-				return err
-			}
-			continue
-		}
-
-		log.Printf("station %s: connected, mount is available at %s", s.ID, s.source.MountURL())
-		stopCloseOnCancel := closeOnCancel(ctx, conn)
-		err = s.playContinuously(ctx, conn)
-		conn.Close()
-		stopCloseOnCancel()
-		s.setStopped()
-
-		if errors.Is(err, context.Canceled) {
-			return err
-		}
-		log.Printf("station %s: stream connection ended: %v", s.ID, err)
-		if err := sleep(ctx, reconnectDelay); err != nil {
-			return err
-		}
-	}
-}
-
-func (s *Station) playContinuously(ctx context.Context, dst io.Writer) error {
-	var pending []Command
-	session := s.streamer.NewSession()
-
-	for {
-		track, isAnnouncement := s.nextTrack(pending)
-		pending = nil
-
-		s.setPlaying(track)
-		if isAnnouncement {
-			log.Printf("station %s: playing announcement %q", s.ID, track.Path)
-		} else {
-			log.Printf("station %s: playing track %q", s.ID, track.Path)
-		}
-
-		err, queued := s.playTrack(ctx, dst, session, track)
-		pending = append(pending, queued...)
-
-		if errors.Is(err, mp3stream.ErrSkipped) {
-			log.Printf("station %s: skipped %q", s.ID, track.Path)
-			continue
-		}
-		if err != nil {
-			return err
-		}
-	}
-}
-
-func (s *Station) nextTrack(commands []Command) (playlist.Track, bool) {
-	for _, command := range commands {
-		if command.Type != CommandPlayAnnouncement {
-			continue
-		}
-		if command.Path != "" {
-			return playlist.Track{Path: command.Path, Title: command.Path}, true
-		}
-		if s.announcements != nil {
-			return s.announcements.Next(), true
-		}
-		log.Printf("station %s: announcement requested but no path or announcements playlist is configured", s.ID)
-	}
-	return s.playlist.Next(), false
-}
-
-func (s *Station) playTrack(ctx context.Context, dst io.Writer, session *mp3stream.Session, track playlist.Track) (error, []Command) {
-	file, err := os.Open(track.Path)
-	if err != nil {
-		return fmt.Errorf("open track %q: %w", track.Path, err), nil
-	}
-	defer file.Close()
-
-	skip := make(chan struct{})
-	done := make(chan error, 1)
-	var queued []Command
-	closeSkip := sync.OnceFunc(func() {
-		close(skip)
-	})
-
-	go func() {
-		done <- session.Stream(ctx, dst, file, skip)
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			closeSkip()
-			return ctx.Err(), queued
-		case err := <-done:
-			return err, queued
-		case command := <-s.Commands:
-			switch command.Type {
-			case CommandSkipTrack:
-				closeSkip()
-				return s.waitForStoppedStream(ctx, done, queued)
-			case CommandPlayAnnouncement:
-				queued = append(queued, command)
-				closeSkip()
-				return s.waitForStoppedStream(ctx, done, queued)
-			default:
-				log.Printf("station %s: ignoring unknown command %q", s.ID, command.Type)
-			}
-		}
-	}
-}
-
-func (s *Station) waitForStoppedStream(ctx context.Context, done <-chan error, queued []Command) (error, []Command) {
-	select {
-	case <-ctx.Done():
-		return ctx.Err(), queued
-	case err := <-done:
-		if err == nil {
-			return mp3stream.ErrSkipped, queued
-		}
-		return err, queued
-	}
-}
-
-func (s *Station) setPlaying(track playlist.Track) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	s.state.CurrentTrack = track
-	s.state.Playing = true
-	s.state.StartedAt = time.Now()
+	state := State{
+		Config:               s.config,
+		Mode:                 s.mode,
+		Queue:                QueueState{Revision: s.revision, Tracks: copyTracks(s.queue)},
+		PendingAnnouncements: len(s.announcements),
+		StartedAt:            s.startedAt,
+		LastError:            s.lastError,
+		Connected:            s.connected,
+	}
+	if s.current != nil {
+		current := *s.current
+		state.CurrentTrack = &current
+	}
+	if s.currentAnn != nil {
+		current := *s.currentAnn
+		state.CurrentAnnouncement = &current
+	}
+	return state
 }
 
-func (s *Station) setStopped() {
+func (s *Station) UpdateConfig(cfg Config, correlationID string) {
+	cfg.ID = s.ID
+	cfg.StreamURL = s.deps.Source.MountURL()
+	cfg = cfg.Normalize()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.state.Playing = false
+	s.config = cfg
+	s.Name = cfg.Name
+	s.mu.Unlock()
+	s.emit("station.config_updated", correlationID, map[string]any{"config": cfg})
 }
 
-func sleep(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
+func (s *Station) ReplaceQueue(revision uint64, tracks []playlist.Track, correlationID string) (State, error) {
+	if len(tracks) > MaxQueueTracks {
+		return State{}, ErrQueueTooLarge
+	}
+	s.mu.Lock()
+	if revision <= s.revision {
+		s.mu.Unlock()
+		return State{}, ErrStaleRevision
+	}
+	normalized := make([]playlist.Track, len(tracks))
+	for i, track := range tracks {
+		item, err := track.Normalize(s.config.TransitionDefaults)
+		if err != nil {
+			s.mu.Unlock()
+			return State{}, err
+		}
+		normalized[i] = item
+	}
+	s.queue = normalized
+	s.revision = revision
+	s.mu.Unlock()
+	s.signal()
+	s.emit("queue.applied", correlationID, map[string]any{"revision": revision, "size": len(tracks)})
+	if len(tracks) <= 2 {
+		s.emit("queue.low", correlationID, map[string]any{"remaining": len(tracks)})
+	}
+	return s.State(), nil
+}
 
+func (s *Station) AddAnnouncement(announcement playlist.Announcement) (bool, error) {
+	if err := announcement.Validate(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	if _, exists := s.seenCommands[announcement.CommandID]; exists {
+		s.mu.Unlock()
+		return false, nil
+	}
+	if len(s.announcements) >= 32 {
+		s.mu.Unlock()
+		return false, ErrAnnouncementQueue
+	}
+	s.seenCommands[announcement.CommandID] = struct{}{}
+	s.announcements = append(s.announcements, announcement)
+	s.mu.Unlock()
+	s.signal()
+	s.emit("announcement.queued", announcement.CorrelationID, map[string]any{"commandId": announcement.CommandID})
+	return true, nil
+}
+
+func (s *Station) Send(command Command) error {
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
+	case s.commands <- command:
 		return nil
+	default:
+		return ErrCommandQueueFull
 	}
 }
 
-func closeOnCancel(ctx context.Context, closer io.Closer) func() {
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		select {
-		case <-ctx.Done():
-			closer.Close()
-		case <-stop:
-		}
-	}()
-	return func() {
-		close(stop)
-		<-done
+func (s *Station) setConnected(connected bool) {
+	s.mu.Lock()
+	s.connected = connected
+	s.mu.Unlock()
+}
+
+func (s *Station) signal() {
+	select {
+	case s.wakeup <- struct{}{}:
+	default:
 	}
+}
+
+func (s *Station) emit(eventType, correlationID string, payload map[string]any) {
+	s.mu.Lock()
+	s.sequence++
+	sequence := s.sequence
+	s.mu.Unlock()
+	_ = s.deps.Events.Publish(events.Event{
+		Type:          eventType,
+		StationID:     s.ID,
+		Sequence:      sequence,
+		CorrelationID: correlationID,
+		Payload:       payload,
+	})
+}
+
+func copyTracks(tracks []playlist.Track) []playlist.Track {
+	result := make([]playlist.Track, len(tracks))
+	copy(result, tracks)
+	return result
 }

@@ -10,23 +10,49 @@ services:
       ICECAST_HOSTNAME: localhost
     restart: unless-stopped
 
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   radio:
     build: .
     depends_on:
       - icecast
+      - minio
+      - redis
     ports:
       - "8080:8080"
-    volumes:
-      - ./tracklist:/app/tracklist:ro
     environment:
       ICECAST_URL: http://icecast:8000
       ICECAST_SOURCE_PASSWORD: hackme
-      ICECAST_MOUNT: /radio.mp3
-      STATION_ID: ${STATION_ID:-default}
-      STATION_COUNT: ${STATION_COUNT:-}
-      STATIONS: ${STATIONS:-}
-      STATION_NAME: ${STATION_NAME:-}
       HTTP_ADDR: :8080
-      PLAYLIST_DIR: tracklist
-      ANNOUNCEMENTS_DIR: ""
+      MAX_STATIONS: ${MAX_STATIONS:-20}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+      REDIS_ADDR: redis:6379
+      REDIS_STREAM: radio.events
+      MEDIA_CACHE_DIR: /var/cache/radio-engine
+    volumes:
+      - radio-cache:/var/cache/radio-engine
     restart: unless-stopped
+
+volumes:
+  minio-data:
+  radio-cache:

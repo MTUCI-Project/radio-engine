@@ -1,16 +1,20 @@
 package station
 
-const (
-	CommandSkipTrack        = "skip_track"
-	CommandPlayAnnouncement = "play_announcement"
-)
+import "radio_engine/internal/playlist"
 
-var (
-	SkipTrack        = Command{Type: CommandSkipTrack}
-	PlayAnnouncement = Command{Type: CommandPlayAnnouncement}
+type CommandType string
+
+const (
+	CommandPlay CommandType = "play"
+	CommandStop CommandType = "stop"
+	CommandSkip CommandType = "skip"
 )
 
 type Command struct {
-	Type string
-	Path string
+	Type          CommandType
+	CorrelationID string
+}
+
+type AnnouncementCommand struct {
+	Announcement playlist.Announcement
 }

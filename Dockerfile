@@ -1,23 +1,30 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-RUN go build -o /out/radio ./cmd/radio
+RUN go build -trimpath -ldflags="-s -w" -o /out/radio ./cmd/radio
 
-FROM alpine:3.20
+FROM alpine:3.22
 
+RUN apk add --no-cache ffmpeg ca-certificates
 WORKDIR /app
 COPY --from=build /out/radio /usr/local/bin/radio
-COPY tracklist ./tracklist
 
 ENV ICECAST_URL=http://icecast:8000 \
     ICECAST_SOURCE_USER=source \
-    ICECAST_SOURCE_PASSWORD=hackme \
-    ICECAST_MOUNT=/radio.mp3 \
-    STATION_ID=default \
     HTTP_ADDR=:8080 \
-    PLAYLIST_DIR=tracklist
+    MAX_STATIONS=20 \
+    FFMPEG_PATH=ffmpeg \
+    FFPROBE_PATH=ffprobe \
+    MINIO_ENDPOINT=minio:9000 \
+    MINIO_SECURE=false \
+    MEDIA_CACHE_DIR=/var/cache/radio-engine \
+    REDIS_ADDR=redis:6379 \
+    REDIS_STREAM=radio.events
+
+RUN mkdir -p /var/cache/radio-engine
 
 CMD ["radio"]

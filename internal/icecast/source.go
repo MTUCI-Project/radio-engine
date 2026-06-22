@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type Config struct {
 }
 
 type Source struct {
+	mu  sync.RWMutex
 	cfg Config
 }
 
@@ -33,11 +35,22 @@ func NewSource(cfg Config) *Source {
 }
 
 func (s *Source) MountURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.cfg.URL + s.cfg.Mount
 }
 
+func (s *Source) Update(cfg Config) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
+
 func (s *Source) Connect(ctx context.Context) (io.WriteCloser, error) {
-	streamURL, err := url.Parse(s.MountURL())
+	s.mu.RLock()
+	cfg := s.cfg
+	s.mu.RUnlock()
+	streamURL, err := url.Parse(cfg.URL + cfg.Mount)
 	if err != nil {
 		return nil, fmt.Errorf("parse icecast url: %w", err)
 	}
@@ -51,7 +64,7 @@ func (s *Source) Connect(ctx context.Context) (io.WriteCloser, error) {
 		return nil, fmt.Errorf("dial icecast: %w", err)
 	}
 
-	if err := s.writeHeaders(conn, streamURL); err != nil {
+	if err := writeHeaders(conn, streamURL, cfg); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -73,10 +86,10 @@ func (s *Source) Connect(ctx context.Context) (io.WriteCloser, error) {
 	return conn, nil
 }
 
-func (s *Source) writeHeaders(w io.Writer, streamURL *url.URL) error {
-	auth := base64.StdEncoding.EncodeToString([]byte(s.cfg.SourceUser + ":" + s.cfg.SourcePass))
+func writeHeaders(w io.Writer, streamURL *url.URL, cfg Config) error {
+	auth := base64.StdEncoding.EncodeToString([]byte(cfg.SourceUser + ":" + cfg.SourcePass))
 	public := "0"
-	if s.cfg.Public {
+	if cfg.Public {
 		public = "1"
 	}
 
@@ -85,9 +98,9 @@ func (s *Source) writeHeaders(w io.Writer, streamURL *url.URL) error {
 	headers.WriteString(fmt.Sprintf("Host: %s\r\n", streamURL.Host))
 	headers.WriteString("Authorization: Basic " + auth + "\r\n")
 	headers.WriteString("Content-Type: audio/mpeg\r\n")
-	headers.WriteString("Ice-Name: " + s.cfg.Name + "\r\n")
-	headers.WriteString("Ice-Description: " + s.cfg.Description + "\r\n")
-	headers.WriteString("Ice-Genre: " + s.cfg.Genre + "\r\n")
+	headers.WriteString("Ice-Name: " + cfg.Name + "\r\n")
+	headers.WriteString("Ice-Description: " + cfg.Description + "\r\n")
+	headers.WriteString("Ice-Genre: " + cfg.Genre + "\r\n")
 	headers.WriteString("Ice-Public: " + public + "\r\n")
 	headers.WriteString("User-Agent: radio-engine/0.2\r\n")
 	headers.WriteString("Connection: close\r\n")
