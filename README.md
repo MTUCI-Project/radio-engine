@@ -18,6 +18,28 @@ docker compose up --build
 
 Сервис стартует без станций. Backend должен создать станции заново после рестарта worker-а.
 
+## Развёртывание на VDS
+
+```bash
+cp .env.example .env
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+prod-стек:
+- поднимает `icecast`, `minio`, `redis` и сам `radio` в контейнерах;
+- создаёт buckets `music`, `alerts` и `archive` в MinIO;
+- публикует наружу только nginx на порту 80;
+- проксирует весь трафик к приложению через `radio:8080`;
+- проверяет готовность сервисов через healthcheck.
+
+После запуска:
+
+```bash
+curl http://localhost/health/ready
+curl http://localhost/metrics
+docker compose -f docker-compose.prod.yml logs -f nginx radio
+```
+
 ## API v1
 
 Создать или обновить станцию со стабильным backend ID:
