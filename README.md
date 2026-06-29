@@ -4,9 +4,21 @@ Stateless Go media-worker для онлайн-радио. Бизнес-бек в
 
 ## Быстрый запуск
 
+В составе всего dev-стека Oncast из корня репозитория:
+
+```bash
+./start-dev.sh
+```
+
+Скрипт поднимает общий Postgres, Redis, MinIO, Icecast и `radio-engine` через корневой `docker-compose.dev.yml`, затем запускает `control-plane` локально.
+
+Только radio-engine и его инфраструктура из этой директории:
+
 ```bash
 docker compose up --build
 ```
+
+Перед standalone-запуском проверьте `radio-engine/.env`; шаблон лежит в `.env.example`.
 
 После запуска:
 
@@ -15,6 +27,7 @@ docker compose up --build
 - metrics: <http://localhost:8080/metrics>
 - Icecast: <http://localhost:8000/>
 - MinIO console: <http://localhost:9001/>
+- Redis: `localhost:6379`
 
 Сервис стартует без станций. Backend должен создать станции заново после рестарта worker-а.
 

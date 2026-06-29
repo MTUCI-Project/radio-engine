@@ -17,8 +17,8 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-admin123}
     volumes:
       - minio-data:/data
     restart: unless-stopped
@@ -31,6 +31,8 @@ services:
 
   radio:
     build: .
+    env_file:
+      - .env
     depends_on:
       - icecast
       - minio
@@ -38,16 +40,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      ICECAST_URL: http://icecast:8000
-      ICECAST_SOURCE_PASSWORD: hackme
       HTTP_ADDR: :8080
-      MAX_STATIONS: ${MAX_STATIONS:-20}
+      ICECAST_URL: http://icecast:8000
       MINIO_ENDPOINT: minio:9000
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
-      MINIO_SECURE: "false"
       REDIS_ADDR: redis:6379
-      REDIS_STREAM: radio.events
       MEDIA_CACHE_DIR: /var/cache/radio-engine
     volumes:
       - radio-cache:/var/cache/radio-engine
